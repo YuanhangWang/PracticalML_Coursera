@@ -1,22 +1,164 @@
----
-title: "PracticeML_Coursera"
-author: "YuanhangWang"
-date: "06/19/2014"
-output: html_document
+PracticeML_Coursera
+===
+06/19/2014
 ---
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+0. Synopsis
+---
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+In this project, I will illustrate the process of data partition, feature filtering, feature creation and training mainly by using `caret` package.
 
-```{r}
-summary(cars)
+The model I will use is `SVM` and `Random Forest`, I should expect that `SVM` consume less time while `Random Forest` has a better performance.
+
+The data for this project come from this source: <http://groupware.les.inf.puc-rio.br/har>
+
+1. Environment & Preparation
+---
+First we load relative libraries, and check the environment.
+
+I use doMC to introduce parallel computation.
+```{r, cache=TRUE}
+library(caret)
+library(doMC)
+library(lubridate)
+registerDoMC(cores = 4)
+sessionInfo()
+```
+2. Data Processing
+---
+Now, we first split the original data to training set and testing set, and take a glimpse on the training set.
+```{r, cache=TRUE}
+data <- read.csv("data/pml-training.csv", na.string = c("NA", ""))
+set.seed(141)
+inTrain <- createDataPartition(y = data$classe, p = 0.6, list = FALSE)
+train.feature <- data[inTrain, -ncol(data)]
+train.outcome <- data[inTrain, ncol(data), drop = FALSE]
+test.feature <- data[-inTrain, -ncol(data)]
+test.outcome <- data[-inTrain, ncol(data), drop = FALSE]
+#str(train.feature)
+#summary(train.feature)
+```
+We found
+
+1. Some of the features are useless
+  + `X` is a index of records, it does nothing to prediction.
+  + `user_name` is the name of candidates, we should involve it in our prediction, otherwise we may encounter over-fitting.
+  + `raw_timestamp_part_1` and `cvtd_timestamp` are duplicate feature, in this prediction, I choose to delete the later one.
+
+```{r, cache=TRUE}
+train.feature <- train.feature[, -c(1, 2, 5)]
 ```
 
-You can also embed plots, for example:
+2. As the outcome is the activity of human, `raw_timestamp_part_1` is way of too tedious, we can use `weekday`, `hour` and `minute` replace it.
 
-```{r, echo=FALSE}
-plot(cars)
+```{r, cache=TRUE}
+time.feature <- function(data) {
+  data[, 1] <- as.POSIXct(data[, 1], origin = "1970-01-01", tz = "UTC")
+  data$wday <- wday(data[, 1])
+  data$hour <- hour(data[, 1])
+  data$minute <- minute(data[, 1])
+  data[, -1]
+}
+train.feature <- time.feature(train.feature)
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+3. Some of the features(e.g. `kurtosis_yaw_belt`) has a lot of NAs, they do nothing help to our prediction, we should remove it, here I will remove any feature which has more that 95% are NAs.
+
+```{r, cache=TRUE}
+filter.feature <- function(data, threshold = .95) {
+  p.num <- function(x) {
+    sum(is.na(x)) / length(x)
+  }
+  illness <- apply(data, 2, p.num)
+  which(illness >= threshold)
+}
+ill.feature <- filter.feature(train.feature)
+train.feature <- train.feature[, -ill.feature]
+```
+
+4. Convert factor to numeric to facilitate data compression and training. Now we can check how many features left.
+
+```{r, cache=TRUE}
+train.feature[, 2] <- as.numeric(train.feature[, 2])
+num.feature <- ncol(train.feature)
+```
+
+5. Since we have `r num.feature` features left, we could try to apply PCA to check whether there is linear correlation between features.
+
+```{r, cache=TRUE}
+pca <- preProcess(train.feature, method = "pca", thresh = .975)
+pca
+```
+
+We could have 45% feature less at the expense of 2.5% variation loss, therefore I choose to apply PCA here, and wrap up all the process above for testing set.
+
+```{r, cache=TRUE}
+train.feature <- predict(pca, train.feature)
+redo.process <- function(data, ill.feature, pca) {
+  data <- data[, -c(1, 2, 5)]
+  data <- time.feature(data)
+  data <- data[, -ill.feature]
+  data[, 2] <- as.numeric(data[, 2])
+  predict(pca, data)
+}
+```
+
+3. Prediction
+---
+
+Here I use `SVM` and `Random Forest` predict classes.
+
+* For `SVM`, since we have enough data, I choose the __5-fold cross-validation__, and __RBF__ kernel.
+
+```{r, cache=TRUE}
+ptm <- proc.time()
+set.seed(592)
+cv.control <- trainControl(method = "cv", number = 5)
+svm.model <- train(train.feature, train.outcome$classe, method = "svmRadial", trControl = cv.control, tuneLength = 5)
+svm.running.time <- proc.time() - ptm
+```
+
+* For `Random Forest`, I choose to __resample 5 times__.
+
+```{r, cache=TRUE}
+ptm <- proc.time()
+set.seed(653)
+boot.control <- trainControl(number = 5)
+rf.model <- train(train.feature, train.outcome$classe, method = "rf", trControl = boot.control)
+rf.running.time <- proc.time() - ptm
+```
+
+OK, Now we can check our result, we should expect that `SVM` consume less time while `Random Forest` has a better performance. Let us redo all  the preprocess on testing set first.
+
+```{r, cache=TRUE}
+test.feature <- redo.process(test.feature, ill.feature, pca)
+```
+
+We use `r svm.running.time[2]` for `SVM`, here are the performance.
+
+```{r, cache=TRUE}
+svm.running.time
+svm.model
+svm.pred <- predict(svm.model, test.feature)
+confusionMatrix(svm.pred, test.outcome$classe)
+```
+
+We took `r rf.running.time[2]` to build `Random Forest`.
+
+```{r, cache=TRUE}
+rf.running.time
+rf.model
+rf.pred <- predict(rf.model, test.feature)
+confusionMatrix(rf.pred, test.outcome$classe)
+```
+
+We can also apply it on another testing set.
+
+```{r, cache=TRUE}
+test <- read.csv("data/pml-testing.csv", na.string = c("NA", ""))
+test <- test[, -ncol(test)]
+test <- redo.process(test, ill.feature, pca)
+predict(svm.model, test)
+predict(rf.model, test)
+```
+
